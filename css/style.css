@@ -1,0 +1,48 @@
+:root {
+            --color-background: #1a202c; /* slate-900 */
+            --color-surface: #2d3748;    /* slate-800 */
+            --color-surface-2: #4a5568;  /* slate-700 */
+            --color-border: #718096;     /* slate-500 */
+            --color-text-primary: #edf2f7; /* slate-200 */
+            --color-text-muted: #a0aec0;   /* slate-400 */
+            --color-primary: #4299e1;     /* blue-400 */
+            --color-accent-green: #48bb78; /* green-500 */
+            --color-accent-red: #f56565;   /* red-500 */
+            --color-accent-blue: #4299e1;
+            --card-size: 68px;
+        }
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: var(--color-background);
+            color: var(--color-text-primary);
+        }
+        .card-container {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(var(--card-size), 1fr));
+            gap: 4px;
+        }
+        .card-item-wrapper {
+            position: relative;
+        }
+        .card-item-wrapper:hover .card-item {
+            transform: scale(1.05);
+            z-index: 10;
+        }
+        .card-item {
+            width: var(--card-size);
+            height: auto;
+            aspect-ratio: 626 / 912;
+            cursor: pointer;
+            border-radius: 4px;
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
+        }
+        .dragging {
+            opacity: 0.5;
+        }
+        .nav-btn {
+             transition: background-color 0.2s;
+        }
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: var(--color-surface); }
+        ::-webkit-scrollbar-thumb { background: var(--color-surface-2); border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: var(--color-border); }
