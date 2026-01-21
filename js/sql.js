@@ -97,3 +97,46 @@ export function searchCardsByName(searchTerm) {
         return [];
     }
 }
+
+export function searchCardsByIDs(idList) {
+    if (!isDbReady || !db) {
+        console.warn("SQL DB 尚未就緒");
+        return [];
+    }
+
+    const results = [];
+    
+    // 預編譯 SQL 語句 (Prepared Statement)
+    // 我們同時 JOIN datas 表，這樣可以順便拿到 type (雖然是數字)
+    const stmt = db.prepare(`
+        SELECT t.id, t.name, t.desc, d.type 
+        FROM texts t
+        LEFT JOIN datas d ON t.id = d.id
+        WHERE t.id = :id
+    `);
+
+    try {
+        // 在 SQL 引擎內部跑迴圈，速度最快
+        for (const id of idList) {
+            stmt.bind({ ':id': id });
+            
+            if (stmt.step()) {
+                const row = stmt.getAsObject();
+                results.push({
+                    id: row.id,
+                    name: row.name,
+                    desc: row.desc,
+                    type: row.type // 注意：這裡是整數 (例如 33)，需要轉譯
+                });
+            }
+            
+            stmt.reset(); // 重置語句，準備查下一個 ID
+        }
+    } catch (err) {
+        console.error("批量查詢失敗:", err);
+    } finally {
+        stmt.free(); // 務必釋放記憶體
+    }
+
+    return results;
+}

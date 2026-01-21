@@ -4,7 +4,7 @@ import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged }
 import { getFirestore, doc, getDoc, setDoc, updateDoc, deleteDoc, onSnapshot, collection, query, addDoc, getDocs, writeBatch } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
 // Sql Import
-import { initializeSQLDatabase, searchCardsByName } from './sql.js';
+import { initializeSQLDatabase, searchCardsByName, searchCardsByIDs } from './sql.js';
 
 // --- GLOBAL STATE & CONFIG ---
 const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : { apiKey: "YOUR_API_KEY", authDomain: "YOUR_AUTH_DOMAIN", projectId: "YOUR_PROJECT_ID" };
@@ -24,6 +24,7 @@ let sqlInitPromise = null;
 
 // --- POINTS SYSTEM CONFIG ---
 let genesysPointsMap = new Map(); // 改用 Map 存儲 ID -> Points
+let gPointListPromise = null;
 
 const defaultCardPoints = {
     "A Case for K9": 20,
@@ -752,9 +753,18 @@ document.addEventListener('DOMContentLoaded', () => {
     UI.deckScaleSlider.value = savedScale;
     document.documentElement.style.setProperty('--card-size', `${savedScale}px`);
 
-    buildNormalizedPointsMap(); // Build the initial points map with defaults.
-    initializeFirebase();
+    buildNormalizedPointsMap(); // Build the initial points map with defaults.    
     sqlInitPromise = initializeSQLDatabase();
+    gPointListPromise = fetch('./data/gpointlist.conf')
+        .then(res => {
+            if (!res.ok) throw new Error("Config not found");
+            return res.text();
+        })
+        .catch(err => {
+            console.warn("無法載入點數表:", err);
+            return ""; // 失敗回傳空字串，避免 Promise.all 炸裂
+        });
+    initializeFirebase();    
     attachEventListeners();
     showView('deckBuilderView');
 });
@@ -783,10 +793,11 @@ async function initializeFirebase() {
                     // 所以這裡不需要呼叫 loadInitialData，也不要隱藏 Overlay
                 } catch (authError) {
                     console.error("Authentication failed:", authError);
-                    showMessage("Could not authenticate. Some features might not work.");
-                    
-                    // 即使登入失敗，我們至少要等 SQL 載入完才能讓使用者用搜尋功能
-                    await sqlInitPromise;
+                    showMessage("Could not authenticate. Some features might not work.");                      
+                    // 【關鍵修改】：登入失敗時，強制進入訪客模式的載入流程
+                    // 這樣才能執行 Promise.all 並解析 gPointListPromise
+                    userId = null;
+                    await loadInitialData();
                     UI.loadingOverlay.classList.add('hidden');
                 }
             }
@@ -798,22 +809,37 @@ async function initializeFirebase() {
 }
 
 async function loadInitialData() {
-    if (!userId) return;
     
     // 1. 啟動 Firebase 資料讀取
-    const firebasePromises = [loadCardDatabase(), loadUserDecks(), loadUserSettings()];
-    
-    try {
-        // 【修改重點 2】：同時等待 Firebase 資料 和 SQL 資料庫
-        // Promise.all 會等待陣列中所有的 Promise 都 resolve
-        const [configResponse] = await Promise.all([
-            fetch('./data/gpointlist.conf').then(res => res.text()).catch(() => ""),
-            ...firebasePromises,             
-            sqlInitPromise // 這裡把稍早存的 SQL Promise 放進來等
-        ]);
-        if (configResponse) {
-        parseGenesysConfig(configResponse);
+    const firebasePromises = [];
+    if (userId) {
+        firebasePromises.push(loadCardDatabase());
+        firebasePromises.push(loadUserDecks());
+        firebasePromises.push(loadUserSettings());
+    } else {
+        // 訪客模式：讀取本地資料
+        loadLocalCardDatabase();
+        loadLocalUserDecks();
+        loadLocalUserSettings();
     }
+    try {
+        // 【核心邏輯】：這裡會同時等待 設定檔、Firebase(如果有)、SQL
+        const [configResponse] = await Promise.all([
+            gPointListPromise,   // 索引 0 -> 對應 configResponse
+            ...firebasePromises, // 索引 1~3 -> 等待完成但不需回傳值
+            sqlInitPromise       // 索引 4 -> 等待 SQL 就緒
+        ]);
+        // 收到設定檔內容，執行解析
+        if (configResponse) {
+            console.log("讀取到點數表，開始解析...");
+            parseGenesysConfig(configResponse);
+        }
+        // 如果是訪客模式，因為沒有 onSnapshot 自動更新，需手動渲染一次
+        if (!userId) {
+            renderCardDatabase();
+            renderCurrentDeck(); // 或 renderDeckSelector
+            updatePointsDisplay();
+        }
         console.log("所有資料 (Firebase + SQL) 皆已就緒");
         
     } catch (error) {
@@ -841,6 +867,33 @@ async function loadUserSettings() {
     buildNormalizedPointsMap(); // Build map with loaded user data (or defaults if none).
     UI.pointBudgetInput.value = pointBudget;
     updatePointsDisplay();
+}
+
+// --- LOCAL STORAGE HELPERS ---
+function loadLocalCardDatabase() {
+    const localData = localStorage.getItem('guest_card_db');
+    cardDatabase = localData ? JSON.parse(localData) : [];
+    // 本地資料需要排序
+    cardDatabase.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function loadLocalUserDecks() {
+    const localData = localStorage.getItem('guest_decks');
+    deckLists = localData ? JSON.parse(localData) : [];
+}
+
+function loadLocalUserSettings() {
+    const localData = localStorage.getItem('guest_settings');
+    if (localData) {
+        const settings = JSON.parse(localData);
+        userCardPoints = settings.customPoints || {};
+        pointBudget = settings.budget || 100;
+    } else {
+        userCardPoints = {};
+        pointBudget = 100;
+    }
+    buildNormalizedPointsMap();
+    UI.pointBudgetInput.value = pointBudget;
 }
 
 // --- EVENT LISTENERS ---
@@ -1015,8 +1068,7 @@ function renderSearchResultsModal(cards) {
                     ${pointsBadge}
                 </div>
                 <div class="flex flex-col truncate">
-                    <span class="text-sm font-medium truncate text-[var(--color-text-main)]">${cardData.name}</span>
-                    <span class="text-xs text-[var(--color-text-muted)]">${cardData.type || ''}</span>
+                    <span class="text-sm font-medium truncate text-[var(--color-text-main)]">${cardData.name}</span>                    
                 </div>
             </div>
             
@@ -1046,7 +1098,7 @@ function renderSearchResultsModal(cards) {
 }
 
 async function addCardToDatabase(cardData) {
-    if (!userId) { showMessage("You must be logged in to add cards."); return; }
+    
     if (cardDatabase.some(card => card.id === cardData.id.toString())) {
         showMessage(`'${cardData.name}' is already in the database.`);
         return;
@@ -1058,7 +1110,16 @@ async function addCardToDatabase(cardData) {
         imageUrl: cardData.card_images[0].image_url
     };
     try {
-        await setDoc(doc(db, `artifacts/${appId}/users/${userId}/cards`, newCard.id), newCard);
+        if (userId) {
+            // Firebase 模式
+            await setDoc(doc(db, `artifacts/${appId}/users/${userId}/cards`, newCard.id), newCard);
+        } else {
+            // [修改] 訪客模式：寫入 LocalStorage
+            cardDatabase.push(newCard);
+            cardDatabase.sort((a, b) => a.name.localeCompare(b.name)); // 保持排序
+            localStorage.setItem('guest_card_db', JSON.stringify(cardDatabase));
+            renderCardDatabase(); // 需手動重新渲染
+        }
         showMessage(`Added '${newCard.name}' to the database.`);
     } catch(e) {
         console.error("Error adding card to DB:", e);
@@ -1068,9 +1129,11 @@ async function addCardToDatabase(cardData) {
 
 function deleteCardFromDb(cardId) {
     showConfirmModal("Are you sure you want to delete this card from your database? This will also remove it from all of your saved decks.", async () => {
-        if (!userId) { showMessage("You must be logged in to delete cards."); return; }
+       
         try {
-            // Also remove from all decks that contain this card
+            if (userId) 
+            {
+                // Also remove from all decks that contain this card
             const batch = writeBatch(db);
             deckLists.forEach(deck => {
                 const needsUpdate = deck.main.includes(cardId) || deck.side.includes(cardId) || deck.extra.includes(cardId);
@@ -1098,6 +1161,33 @@ function deleteCardFromDb(cardId) {
                 currentDeck.extra = currentDeck.extra.filter(id => id !== cardId);
                 renderCurrentDeck();
             }
+            }
+            else
+            {
+                // [修改] 訪客模式
+                // 1. 從資料庫移除
+                cardDatabase = cardDatabase.filter(c => c.id !== cardId);
+                localStorage.setItem('guest_card_db', JSON.stringify(cardDatabase));
+
+                // 2. 從所有牌組移除該卡
+                deckLists.forEach(deck => {
+                    deck.main = deck.main.filter(id => id !== cardId);
+                    deck.side = deck.side.filter(id => id !== cardId);
+                    deck.extra = deck.extra.filter(id => id !== cardId);
+                });
+                localStorage.setItem('guest_decks', JSON.stringify(deckLists));
+
+                // 3. 如果當前牌組有用到，更新畫面
+                if(currentDeck.main.includes(cardId) || currentDeck.side.includes(cardId) || currentDeck.extra.includes(cardId)){
+                    currentDeck.main = currentDeck.main.filter(id => id !== cardId);
+                    currentDeck.side = currentDeck.side.filter(id => id !== cardId);
+                    currentDeck.extra = currentDeck.extra.filter(id => id !== cardId);
+                    renderCurrentDeck();
+                }
+                
+                renderCardDatabase(); // 手動重繪側邊欄
+            }
+            
 
             showMessage("Card deleted from database and all decks.");
         } catch(e) {
@@ -1279,7 +1369,8 @@ function importDeckFromYDK(event) {
         }
         
         if (unknownCardIds.size > 0) {
-            await fetchAndAddUnknownCards([...unknownCardIds]);
+            //await fetchAndAddUnknownCards([...unknownCardIds]);
+            await resolveMissingCardsWithSQL([...unknownCardIds]);
         }
 
         currentDeck = { ...newDeck, sidingPatterns: {} };
@@ -1316,6 +1407,62 @@ async function fetchAndAddUnknownCards(cardIds) {
     } finally {
         UI.loadingOverlay.classList.add('hidden');
     }
+}
+
+async function resolveMissingCardsWithSQL(cardIds) {
+    // 1. 直接呼叫新的批量函式
+    const sqlResults = searchCardsByIDs(cardIds);
+
+    if (sqlResults.length === 0) return;
+
+    showMessage(`Resolving ${sqlResults.length} cards from local database...`);
+
+    // 2. 轉換資料格式 (SQL 結果 -> App 格式)
+    const newCards = sqlResults.map(row => {
+        return {
+            id: row.id.toString(),
+            name: row.name,
+            // 這裡可以做簡單的 Type 判斷，或是先給通用值
+            type: convertType(row.type), 
+            // 圖片網址生成
+            imageUrl: `https://images.ygoprodeck.com/images/cards_small/${row.id}.jpg`
+        };
+    });
+
+    // 3. 儲存資料 (原本的邏輯保持不變)
+    if (userId) {
+        const batch = writeBatch(db);
+        newCards.forEach(card => {
+            const cardRef = doc(db, `artifacts/${appId}/users/${userId}/cards`, card.id);
+            batch.set(cardRef, card);
+        });
+        await batch.commit();
+    } else {
+        // 訪客模式
+        let addedCount = 0;
+        newCards.forEach(card => {
+            if (!cardDatabase.some(c => c.id === card.id)) {
+                cardDatabase.push(card);
+                addedCount++;
+            }
+        });
+        
+        if (addedCount > 0) {
+            cardDatabase.sort((a, b) => a.name.localeCompare(b.name));
+            localStorage.setItem('guest_card_db', JSON.stringify(cardDatabase));
+            renderCardDatabase();
+        }
+    }
+}
+
+// 輔助函式：簡單將 YGOPRO 的整數 Type 轉為文字 (可選)
+function convertType(typeInt) {
+    // 簡單判斷：怪獸通常都有特定的 bit (例如 type & 1 或者是 Monster)
+    // 這裡只做最粗略的分類，YGOPRO 的 type 定義很複雜
+    if (typeInt & 0x1) return "Monster"; 
+    if (typeInt & 0x2) return "Spell Card";
+    if (typeInt & 0x4) return "Trap Card";
+    return "Unknown (Local)";
 }
 
 function updateDeckOrder() {
