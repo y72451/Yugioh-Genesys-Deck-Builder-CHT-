@@ -657,6 +657,7 @@ function buildNormalizedPointsMap() {
  * @param {string} configText 
  */
 function parseGenesysConfig(configText) {
+    console.log("嘗試讀取gpointlist");
     const lines = configText.split(/\r?\n/);
     const newMap = new Map();
     let currentVersion = "Default";
@@ -806,7 +807,8 @@ async function loadInitialData() {
         // 【修改重點 2】：同時等待 Firebase 資料 和 SQL 資料庫
         // Promise.all 會等待陣列中所有的 Promise 都 resolve
         const [configResponse] = await Promise.all([
-            ...firebasePromises, 
+            fetch('./data/gpointlist.conf').then(res => res.text()).catch(() => ""),
+            ...firebasePromises,             
             sqlInitPromise // 這裡把稍早存的 SQL Promise 放進來等
         ]);
         if (configResponse) {
@@ -987,25 +989,55 @@ function renderSearchResultsModal(cards) {
     }
     cards.forEach(cardData => {
         const isAlreadyInDb = cardDatabase.some(card => card.id === cardData.id.toString());
+
+        // --- [新增] 取得點數 ---
+        const points = getCardPoints(cardData);
+
+
         const cardEl = document.createElement('div');
-        cardEl.className = 'p-2 flex items-center justify-between bg-[var(--color-surface-2)]/50 rounded-lg';
+        cardEl.className = 'p-2 flex items-center justify-between bg-[var(--color-surface-2)]/50 rounded-lg hover:bg-[var(--color-surface-2)] transition-colors';
+
         const escapedCardData = JSON.stringify(cardData).replace(/'/g, '&#39;');
+
+        // --- [新增] 點數 Badge HTML ---
+        // 如果有點數，顯示紅色標籤；沒有則留空
+        const pointsBadge = points > 0 
+            ? `<span class="absolute bottom-0 right-0 bg-red-600/90 text-white text-[9px] font-bold px-1.5 py-0.5 rounded-tl-md shadow-sm pointer-events-none z-10">${points}</span>` 
+            : '';
+
         cardEl.innerHTML = `
             <div class="flex items-center gap-3 overflow-hidden">
-                <img src="${cardData.card_images[0].image_url_small}" class="w-10 h-auto rounded-md flex-shrink-0" onerror="this.onerror=null;this.src='https://placehold.co/40x58/2d3748/e2e8f0?text=?';">
-                <span class="text-sm font-medium truncate">${cardData.name}</span>
+                <div class="relative flex-shrink-0 w-10">
+                    <img src="${cardData.card_images[0].image_url_small}" 
+                         class="w-full h-auto rounded-md object-cover" 
+                         loading="lazy"
+                         onerror="this.onerror=null;this.src='https://placehold.co/40x58/2d3748/e2e8f0?text=?';">
+                    ${pointsBadge}
+                </div>
+                <div class="flex flex-col truncate">
+                    <span class="text-sm font-medium truncate text-[var(--color-text-main)]">${cardData.name}</span>
+                    <span class="text-xs text-[var(--color-text-muted)]">${cardData.type || ''}</span>
+                </div>
             </div>
-            <button data-card-data='${escapedCardData}' class="flex-shrink-0 text-[var(--color-accent-green)] hover:text-green-300 text-xs font-bold px-3 py-1 rounded-md ${isAlreadyInDb ? 'bg-slate-600 text-slate-400 cursor-not-allowed' : 'bg-green-800/50 hover:bg-green-700/50'}" ${isAlreadyInDb ? 'disabled' : ''}>
+            
+            <button data-card-data='${escapedCardData}' 
+                    class="flex-shrink-0 ml-2 text-xs font-bold px-3 py-1 rounded-md transition-colors ${isAlreadyInDb 
+                        ? 'bg-slate-700 text-slate-500 cursor-not-allowed' 
+                        : 'bg-[var(--color-primary)]/20 text-[var(--color-primary)] hover:bg-[var(--color-primary)]/30'}" 
+                    ${isAlreadyInDb ? 'disabled' : ''}>
                 ${isAlreadyInDb ? 'In DB' : 'Add'}
             </button>`;
         if (!isAlreadyInDb) {
             cardEl.querySelector('button').addEventListener('click', async (e) => {
                 const btn = e.currentTarget;
+                // 讀取時還原跳脫
                 const data = JSON.parse(btn.dataset.cardData);
                 await addCardToDatabase(data);
+                
+                // 更新按鈕狀態
                 btn.textContent = 'In DB';
                 btn.disabled = true;
-                btn.className = 'flex-shrink-0 text-slate-400 bg-slate-600 cursor-not-allowed text-xs font-bold px-3 py-1 rounded-md';
+                btn.className = 'flex-shrink-0 ml-2 bg-slate-700 text-slate-500 cursor-not-allowed text-xs font-bold px-3 py-1 rounded-md';
             });
         }
         UI.searchResultsList.appendChild(cardEl);
