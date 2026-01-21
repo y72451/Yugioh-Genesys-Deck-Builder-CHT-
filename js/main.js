@@ -3,6 +3,9 @@ import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebas
 import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
 import { getFirestore, doc, getDoc, setDoc, updateDoc, deleteDoc, onSnapshot, collection, query, addDoc, getDocs, writeBatch } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
+// Sql Import
+import { initializeSQLDatabase, searchCardsByName } from './sql.js';
+
 // --- GLOBAL STATE & CONFIG ---
 const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : { apiKey: "YOUR_API_KEY", authDomain: "YOUR_AUTH_DOMAIN", projectId: "YOUR_PROJECT_ID" };
 const appId = typeof __app_id !== 'undefined' ? __app_id : 'ygo-genesys-default';
@@ -16,6 +19,11 @@ let sidingState = { out: [], in: [] };
 let userCardPoints = {};
 let pointBudget = 100;
 let normalizedPointsMap = new Map();
+
+let sqlInitPromise = null;
+
+// --- POINTS SYSTEM CONFIG ---
+let genesysPointsMap = new Map(); // 改用 Map 存儲 ID -> Points
 
 const defaultCardPoints = {
     "A Case for K9": 20,
@@ -644,6 +652,39 @@ function buildNormalizedPointsMap() {
     }
 }
 
+/**
+ * 解析類似 lflist.conf 格式的字串
+ * @param {string} configText 
+ */
+function parseGenesysConfig(configText) {
+    const lines = configText.split(/\r?\n/);
+    const newMap = new Map();
+    let currentVersion = "Default";
+
+    lines.forEach(line => {
+        line = line.trim();
+        if (!line || line.startsWith('#')) return; // 跳過空行與註解
+
+        if (line.startsWith('!')) {
+            currentVersion = line.substring(1).trim();
+            return;
+        }
+
+        // 格式: [ID] [Points] # [Comment]
+        const parts = line.split('#')[0].trim().split(/\s+/);
+        if (parts.length >= 2) {
+            const cardId = parts[0];
+            const points = parseInt(parts[1], 10);
+            if (!isNaN(points)) {
+                newMap.set(cardId, points);
+            }
+        }
+    });
+    
+    genesysPointsMap = newMap;
+    console.log(`已載入版本: ${currentVersion}, 共 ${newMap.size} 筆點數資料`);
+}
+
 // --- UI ELEMENT REFERENCES ---
 const UI = {
     // Main views
@@ -712,13 +753,14 @@ document.addEventListener('DOMContentLoaded', () => {
 
     buildNormalizedPointsMap(); // Build the initial points map with defaults.
     initializeFirebase();
+    sqlInitPromise = initializeSQLDatabase();
     attachEventListeners();
     showView('deckBuilderView');
 });
 
 async function initializeFirebase() {
     try {
-        UI.loadingOverlay.classList.remove('hidden');
+        UI.loadingOverlay.classList.remove('hidden'); // 確保 Loading 顯示
         app = initializeApp(firebaseConfig);
         db = getFirestore(app);
         auth = getAuth(app);
@@ -726,33 +768,59 @@ async function initializeFirebase() {
         onAuthStateChanged(auth, async (user) => {
             if (user) {
                 userId = user.uid;
+                // 這裡會去載入使用者資料
                 await loadInitialData();
             } else {
                 try {
+                    // 匿名登入邏輯
                     if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
                         await signInWithCustomToken(auth, __initial_auth_token);
                     } else {
                         await signInAnonymously(auth);
                     }
+                    // 注意：匿名登入成功後，會再次觸發 onAuthStateChanged 進入上面的 if(user) 區塊
+                    // 所以這裡不需要呼叫 loadInitialData，也不要隱藏 Overlay
                 } catch (authError) {
                     console.error("Authentication failed:", authError);
                     showMessage("Could not authenticate. Some features might not work.");
+                    
+                    // 即使登入失敗，我們至少要等 SQL 載入完才能讓使用者用搜尋功能
+                    await sqlInitPromise;
+                    UI.loadingOverlay.classList.add('hidden');
                 }
             }
-            UI.loadingOverlay.classList.add('hidden');
         });
     } catch (error) {
         console.error("Firebase initialization failed:", error);
-        showMessage("Critical error: Could not connect to the database.");
         UI.loadingOverlay.classList.add('hidden');
     }
 }
 
 async function loadInitialData() {
     if (!userId) return;
-    UI.loadingOverlay.classList.remove('hidden');
-    await Promise.all([loadCardDatabase(), loadUserDecks(), loadUserSettings()]);
-    UI.loadingOverlay.classList.add('hidden');
+    
+    // 1. 啟動 Firebase 資料讀取
+    const firebasePromises = [loadCardDatabase(), loadUserDecks(), loadUserSettings()];
+    
+    try {
+        // 【修改重點 2】：同時等待 Firebase 資料 和 SQL 資料庫
+        // Promise.all 會等待陣列中所有的 Promise 都 resolve
+        const [configResponse] = await Promise.all([
+            ...firebasePromises, 
+            sqlInitPromise // 這裡把稍早存的 SQL Promise 放進來等
+        ]);
+        if (configResponse) {
+        parseGenesysConfig(configResponse);
+    }
+        console.log("所有資料 (Firebase + SQL) 皆已就緒");
+        
+    } catch (error) {
+        console.error("資料載入部分失敗:", error);
+        showMessage("部分資料載入失敗，請重新整理頁面。");
+    } finally {
+        // 只有當「全部」都跑完 (無論成功失敗)，才把遮罩拿掉
+        UI.loadingOverlay.classList.add('hidden');
+    }
 }
 
 async function loadUserSettings() {
@@ -869,13 +937,39 @@ async function handleCardSearch() {
     if (!cardName) return;
     UI.loadingOverlay.classList.remove('hidden');
     try {
-        const response = await fetch(`https://db.ygoprodeck.com/api/v7/cardinfo.php?fname=${encodeURIComponent(cardName)}`);
-        if (!response.ok) {
-            if(response.status === 400) throw new Error(`No cards found matching "${cardName}".`);
-            throw new Error('Error fetching card data from API.');
+        // 1. 使用 sql.js 進行本地搜尋
+        const localResults = searchCardsByName(cardName);
+
+        if (localResults.length === 0) {
+            // 如果本地沒找到，看你要不要 fallback 回去 call API，
+            // 或者直接報錯。這裡示範直接回報找不到。
+            throw new Error(`找不到符合 "${cardName}" 的卡片。`);
         }
-        const data = await response.json();
-        renderSearchResultsModal(data.data);
+
+        // 2. 將本地資料轉換為 UI 需要的格式
+        // YGOPRODeck API 的格式結構是 { data: [ {id, name, type, card_images: [...]}, ... ] }
+        // 我們要模擬這個結構
+        const formattedData = localResults.map(card => {
+            return {
+                id: card.id,
+                name: card.name,
+                // 注意：cdb 的 texts 表沒有 'type' (那是 datas 表的欄位)
+                // 如果你需要顯示卡片種類 (Monster/Spell)，你需要額外 JOIN datas 表查詢
+                // 這裡暫時先給個預設值或空字串，因為你的 UI 主要是顯示圖片跟名字
+                type: "Unknown (Local DB)", 
+                desc: card.desc,
+                card_images: [
+                    {
+                        // 3. 關鍵：利用 ID 組合 YGOPRODeck 的圖片網址
+                        image_url: `https://images.ygoprodeck.com/images/cards/${card.id}.jpg`,
+                        image_url_small: `https://images.ygoprodeck.com/images/cards_small/${card.id}.jpg`
+                    }
+                ]
+            };
+        });
+
+        // 3. 渲染結果
+        renderSearchResultsModal(formattedData);
     } catch (error) {
         console.error("Error searching card:", error);
         showMessage(error.message);
@@ -1217,9 +1311,19 @@ function getDragAfterElement(container, x) {
 
 // --- POINTS SYSTEM LOGIC ---
 function getCardPoints(card) {
-    if (!card || !card.name) return 0;
+    if (!card || !card.id) return 0;
+    const cardId = card.id.toString();
+    // 1. 優先從 Genesys .conf 載入的 ID 點數表查詢
+    if (genesysPointsMap.has(cardId)) {
+        return genesysPointsMap.get(cardId);
+    }
+    // 2. 備援方案：如果 ID 沒對應到，才檢查舊有的 userCardPoints (若您仍想保留名稱自訂功能)
     const normalizedName = normalizeCardName(card.name);
-    return normalizedPointsMap.get(normalizedName) || 0;
+    if (normalizedPointsMap.has(normalizedName)) {
+        return normalizedPointsMap.get(normalizedName);
+    }
+
+    return 0;
 }
 
 function calculateDeckPoints() {

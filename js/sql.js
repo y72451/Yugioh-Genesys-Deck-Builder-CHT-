@@ -1,79 +1,99 @@
-// 1. 改用動態載入腳本的方式，避開 import 語法問題
+// sql.js
+
+let db = null;
+let isDbReady = false;
+
+// 載入 SQL.js 引擎 (WASM)
 async function loadSqlEngine() {
     return new Promise((resolve, reject) => {
+        // 檢查是否已經存在 script，避免重複載入
+        if (document.querySelector('script[src*="sql-wasm.js"]')) {
+             if (window.initSqlJs) {
+                 resolve(window.initSqlJs);
+             } else {
+                 // 如果 script 在載入中，稍微等一下 (簡單處理)
+                 setTimeout(() => resolve(window.initSqlJs), 500);
+             }
+             return;
+        }
+
         const script = document.createElement('script');
         script.src = "https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/sql-wasm.js";
-        script.onload = () => resolve(window.initSqlJs); // sql.js 載入後會產生 window.initSqlJs
+        script.onload = () => resolve(window.initSqlJs);
         script.onerror = reject;
         document.head.appendChild(script);
     });
 }
 
-// 取得 UI 元素
-const statusDiv = document.getElementById('status');
-const outputPre = document.getElementById('output');
-
-function updateStatus(msg, isError = false) {
-    statusDiv.textContent = msg;
-    statusDiv.className = isError 
-        ? "mb-4 p-4 bg-red-900/80 border border-red-500 rounded-lg" 
-        : "mb-4 p-4 bg-green-900/80 border border-green-500 rounded-lg";
-    statusDiv.classList.remove('animate-pulse');
-}
-
-async function runTest() {
+// 1. 初始化資料庫 (由 main.js 呼叫)
+export async function initializeSQLDatabase() {
     try {
-        console.log("--- 步驟 1: 載入並初始化 SQL 引擎 ---");
-        updateStatus("正在載入 SQL 引擎...");
-        
+        console.log("正在初始化 SQL 引擎...");
         const initSqlJs = await loadSqlEngine();
-        
-        // 初始化 WebAssembly
         const SQL = await initSqlJs({
             locateFile: file => `https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/${file}`
         });
 
-        console.log("--- 步驟 2: 下載 cards.cdb ---");
-        updateStatus("正在下載資料庫檔案...");
-        
-        // 加上 timestamp 避免瀏覽器快取舊檔案
+        console.log("正在下載 cards.cdb...");
+        // 加上 timestamp 避免快取，正式上線如果檔案不常變動可拿掉 timestamp
         const response = await fetch(`./data/cards.cdb?t=${Date.now()}`);
         
         if (!response.ok) {
-            throw new Error(`找不到檔案！請檢查路徑是否為 ./data/cards.cdb`);
+            throw new Error("無法讀取 ./data/cards.cdb");
         }
 
         const buffer = await response.arrayBuffer();
-        console.log(`檔案大小: ${(buffer.byteLength / 1024 / 1024).toFixed(2)} MB`);
-
-        console.log("--- 步驟 3: 開啟資料庫 ---");
-        const db = new SQL.Database(new Uint8Array(buffer));
-
-        console.log("--- 步驟 4: 執行查詢 ---");
-        // 嘗試查詢 texts 表
-        const query = "SELECT id, name, desc FROM texts LIMIT 5";
-        const results = db.exec(query);
-
-        if (results.length === 0) {
-            updateStatus("資料庫已開啟，但 texts 表格沒有資料", true);
-            return;
-        }
-
-        const rows = results[0].values;
-        let outputText = "";
-        rows.forEach(row => {
-            outputText += `ID: [${row[0]}] \n卡名: ${row[1]} \n描述: ${row[2].substring(0, 50)}...\n\n----------------\n\n`;
-        });
-
-        updateStatus("測試成功！已成功從 cards.cdb 讀取中文資料");
-        outputPre.textContent = outputText;
+        db = new SQL.Database(new Uint8Array(buffer));
+        //window.SQL_DB = db; // <--- 能在 Console 呼叫
+        //console.log("設定windowDB");
+        isDbReady = true;
+        console.log("SQL 資料庫已就緒");
+        return true;
 
     } catch (err) {
-        console.error("發生詳細錯誤:", err);
-        updateStatus(`錯誤: ${err.message}`, true);
-        outputPre.textContent = "詳細錯誤已顯示在 Console (F12)";
+        console.error("SQL 資料庫初始化失敗:", err);
+        return false;
     }
 }
 
-// 啟動測試
-runTest();
+// 2. 以卡名搜尋 (由 main.js 呼叫)
+export function searchCardsByName(searchTerm) {
+    if (!isDbReady || !db) {
+        console.warn("資料庫尚未就緒");
+        return [];
+    }
+
+    try {
+        // 使用 LIKE 進行模糊搜尋，限制回傳 30 筆以免過多
+        // 注意：cards.cdb 通常包含 datas (數值) 和 texts (文字) 兩個表
+        // 這裡我們主要查詢 texts 表來找名字
+        const stmt = db.prepare(`
+            SELECT t.id, t.name, t.desc 
+            FROM texts t 
+            WHERE t.name LIKE :val 
+            LIMIT 30
+        `);
+        
+        const result = [];
+        // 綁定參數避免 SQL Injection (雖然是本地讀取，但養成好習慣)
+        stmt.bind({ ':val': `%${searchTerm}%` });
+
+        while (stmt.step()) {
+            const row = stmt.getAsObject();
+            result.push({
+                id: row.id,
+                name: row.name,
+                desc: row.desc,
+                // 因為 cdb 通常不含圖片與類型詳細分類(除非關聯 datas 表)
+                // 我們這裡先回傳基本資訊，圖片連結會在 main.js 組合
+            });
+        }
+        
+        stmt.free();
+        return result;
+
+    } catch (err) {
+        console.error("搜尋錯誤:", err);
+        return [];
+    }
+}
