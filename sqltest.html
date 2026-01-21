@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <title>CDB 讀取測試</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-900 text-white p-10">
+
+    <h1 class="text-3xl font-bold mb-4">資料庫讀取測試</h1>
+    
+    <div id="status" class="mb-4 p-4 bg-blue-800 rounded-lg animate-pulse">
+        正在準備測試...
+    </div>
+
+    <div class="bg-slate-800 p-4 rounded-lg border border-slate-600">
+        <h2 class="text-xl font-bold mb-2 text-yellow-400">SQL 查詢結果 (前 5 筆)：</h2>
+        <pre id="output" class="font-mono text-sm overflow-auto whitespace-pre-wrap text-green-300">
+等待執行...
+        </pre>
+    </div>
+
+    <script type="module" src="js/sql.js"></script>
+</body>
+</html>
