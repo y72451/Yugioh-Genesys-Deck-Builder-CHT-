@@ -71,7 +71,6 @@ export function searchCardsByName(searchTerm) {
             SELECT t.id, t.name, t.desc 
             FROM texts t 
             WHERE t.name LIKE :val 
-            LIMIT 30
         `);
         
         const result = [];
